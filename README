@@ -1,0 +1,93 @@
+CS 144 Lab 5 README------------by: Drew Schmitt12/7/12--- INTRO ---In Lab 5, I implemented a basic NAT on top of the router from Lab 3.  The NAT can create mappings from an internal (src IP, src port) pair to an external port.  The NAT is also capable of blocking incoming connection attempts (except for SYN's which are kept for 6 seconds before responding with an error message) and generate ICMP error packets when necessary.--- EXTERNAL PORT ALLOCATION ---I decided to use a sorted, growing doubly-linked list to handle my external port allocation.  Essentially, the list starts out with its only entry as the lowest allowed port number (1024).  When a new mapping needs an external port number, this value is removed from this list and - if the list is empty - a new entry whose value is one more than the one removed (1025) is inserted.  In this way, this list is never empty - until the NAT reaches the maximum port limit.  The novel approach used here is that when a mapping is torn down, the used port number is put back into this list in its sorted location.  That way, when the next port number is used, the NAT can just pull off from the head of the list and reuse old ports.
+
+For simplicity, ports were allocated in a simple, incremental fashion - although if used ports of a lower number became available, the NAT would reuse them first.  This leads to a very deterministic mapping of ports, which could have many security implications - especially for an end-point-independent NAT such as this.  It would be more secure to use a uniformly randomly generated number as the external port for a new mapping instead.
+
+--- ICMP ---
+The NAT translates all outbound ICMP requests and all inbound ICMP replies not destined to itself.  If either an internal or external host pings one of the routers interfaces, the router generates an ICMP echo reply.  If an external host tries to ping an internal IP address, the NAT just ignores the packet for security reasons.  If the NAT were to reply with a port unreachable error, then an attacker could gain information that this host is sitting behind the NAT.
+
+For simplicity, the NAT does not translate ICMP error messages it receives since this was not a requirement of the lab.--- TCP STATE TRACKING ---
+The state of outgoing and incoming TCP connections is tracked with a few variables.  Namely, when a TCP connection is established (either internally or externally - if a mapping already exists), the NAT notes the starting sequence number and set a flag that the connection has entered the WAITING_FOR_SYN_ACK.  Then, when the SYN ACK is received from the other side, the NAT notes their sequence number and set a flag that the connection has entered the WAITING_FOR_ACK state (if the ack number of the packet matches the first entity's sequence number plus one).  When the ACK is received and it matches the second entity's sequence number plus one, the connection has entered the ESTABLISHED state.
+
+If the NAT sees a FIN packet at any time during this build up process or when the connection is ESTABLISHED, the NAT sets the FIN_RECEIVED flag.  Once the FIN_RECEIVED flag is set by one party, both parties only have a limited amount of time left to send before the connection will shut down.  Proper operation would be that the NAT should track each side's FIN individually and prevent the side from sending any more data once it sends a FIN.  Furthermore, the NAT could handle duplicate packets and decide to drop them if any arrive.  However, this breaks the end-to-end principle and would require more tracking of sequence numbers and ack numbers, which seems beyond the scope of this project.
+
+In our NAT's timeout loop, any TCP connections that are in the (WAITING_FOR_SYN_ACK or WAITING_FOR_ACK or FIN_RECEIVED) states are considered to be transient and expire with their respective timer.  Otherwise, the TCP connection is compared to the established state timer.  When the respective timer expires, all resources are removed for the connection.  Once all connections are removed from a TCP mapping, all resources are removed from the TCP mapping.
+
+--- SIMULTANEOUS OPEN ---
+When any TCP or ICMP packets arrive at the NAT's external interface and no mapping exists, the NAT immediately responds back with an ICMP port unreachable to the sender.  The only exception to this rule is if the packet is an initial SYN attempt.  In this case, the NAT silently drops the packet and decide to reply back with an ICMP port unreachable 6 seconds later if the NAT has not received an internal TCP SYN that corroborates this external SYN.  If the NAT does receive one - which seems unlikely without a third party sharing the source/destination ports to open the connections on - then the NAT just proceeds with the TCP connection as if the internal host had initiated the first SYN.  The only difference here is that the external host wasn't sent a host unreachable, which may have shut down his application erroneously.
+
+If multiple unsolicited SYNs are received on the router's external interface, the NAT does not update the entry at all in the "silently dropped" list of external SYNs.  If the NAT did, an external host would be able to prevent us from sending it an ICMP port unreachable if it kept barraging us with the same SYN over and over again.  This could lead to some sort of denial-of-service attack since the NAT would be tracking the SYNs state for a longer period of time.
+
+--- MULTI-THREADING ---
+In total, this NAT ran on three separate threads: main listening thread, ARP cache thread, and NAT mapping thread.  Many timeouts were monitored on the NAT mapping thread that could be potentially moved to their own respective threads to improve concurrency.  For example, it would make more sense for the timer that removes entries from the "silently dropped" SYN list to run completely independently of the timer that removes connections and mappings.  For simplicity, all of these timeouts were kept in the same thread.  However, for modularity and concurrency, they should be separated into two separate threads.
+
+--- MISC ---
+The NAT determines a packet as coming from an internal host (outgoing) versus coming from an external host (incoming) solely based on the arrival interface.  A more robust approach would be to check both the arrival interface and the intended external interface.  However, this would introduce small edge cases, such as hair pinning, that might break the logic. 
+
+--- MEMORY LEAKS ---
+No memory leaks were found in my code when running the router with valgrind.  Ping and wget commands were executed and the output valgrind is shown below.  All the major memory leaks appear to exist outside of my code in a malloc in getpwuid().
+
+==15175== 
+==15175== HEAP SUMMARY:
+==15175==     in use at exit: 6,435 bytes in 107 blocks
+==15175==   total heap usage: 507 allocs, 400 frees, 121,365 bytes allocated
+==15175== 
+==15175== 31 bytes in 1 blocks are definitely lost in loss record 4 of 16
+==15175==    at 0x4C2B6CD: malloc (in /usr/lib/valgrind/vgpreload_memcheck-amd64-linux.so)
+==15175==    by 0x5E8F520: ???
+==15175==    by 0x5E8FC01: ???
+==15175==    by 0x5C6492F: ???
+==15175==    by 0x5C64E83: ???
+==15175==    by 0x5C484F8: ???
+==15175==    by 0x5C48A7E: ???
+==15175==    by 0x5A1D516: ???
+==15175==    by 0x5A1F07B: ???
+==15175==    by 0x5A20818: ???
+==15175==    by 0x5A20E08: ???
+==15175==    by 0x510C3FC: getpwuid_r@@GLIBC_2.2.5 (getXXbyYY_r.c:256)
+==15175== 
+==15175== 168 (56 direct, 112 indirect) bytes in 1 blocks are definitely lost in loss record 10 of 16
+==15175==    at 0x4C2B6CD: malloc (in /usr/lib/valgrind/vgpreload_memcheck-amd64-linux.so)
+==15175==    by 0x404E38: sr_add_rt_entry (sr_rt.c:105)
+==15175==    by 0x404D7A: sr_load_rt (sr_rt.c:82)
+==15175==    by 0x4046C5: sr_load_rt_wrap (sr_main.c:322)
+==15175==    by 0x40415A: main (sr_main.c:129)
+==15175== 
+==15175== 288 bytes in 1 blocks are possibly lost in loss record 11 of 16
+==15175==    at 0x4C29DB4: calloc (in /usr/lib/valgrind/vgpreload_memcheck-amd64-linux.so)
+==15175==    by 0x4012074: _dl_allocate_tls (dl-tls.c:297)
+==15175==    by 0x4E3AABC: pthread_create@@GLIBC_2.2.5 (allocatestack.c:571)
+==15175==    by 0x4019E9: sr_init (sr_router.c:53)
+==15175==    by 0x404392: main (sr_main.c:176)
+==15175== 
+==15175== 288 bytes in 1 blocks are possibly lost in loss record 12 of 16
+==15175==    at 0x4C29DB4: calloc (in /usr/lib/valgrind/vgpreload_memcheck-amd64-linux.so)
+==15175==    by 0x4012074: _dl_allocate_tls (dl-tls.c:297)
+==15175==    by 0x4E3AABC: pthread_create@@GLIBC_2.2.5 (allocatestack.c:571)
+==15175==    by 0x401A69: sr_init (sr_router.c:60)
+==15175==    by 0x404392: main (sr_main.c:176)
+==15175== 
+==15175== 3,600 bytes in 90 blocks are definitely lost in loss record 16 of 16
+==15175==    at 0x4C2B6CD: malloc (in /usr/lib/valgrind/vgpreload_memcheck-amd64-linux.so)
+==15175==    by 0x5A262AD: ???
+==15175==    by 0x5A26AD2: ???
+==15175==    by 0x5A26BDC: ???
+==15175==    by 0x5A1D6AA: ???
+==15175==    by 0x5A1F07B: ???
+==15175==    by 0x5A20818: ???
+==15175==    by 0x5A20E08: ???
+==15175==    by 0x510C3FC: getpwuid_r@@GLIBC_2.2.5 (getXXbyYY_r.c:256)
+==15175==    by 0x510BCF2: getpwuid (getXXbyYY.c:117)
+==15175==    by 0x404487: sr_set_user (sr_main.c:215)
+==15175==    by 0x4041C6: main (sr_main.c:138)
+==15175== 
+==15175== LEAK SUMMARY:
+==15175==    definitely lost: 3,687 bytes in 92 blocks
+==15175==    indirectly lost: 112 bytes in 2 blocks
+==15175==      possibly lost: 576 bytes in 2 blocks
+==15175==    still reachable: 2,060 bytes in 11 blocks
+==15175==         suppressed: 0 bytes in 0 blocks
+==15175== Reachable blocks (those to which a pointer was found) are not shown.
+==15175== To see them, rerun with: --leak-check=full --show-reachable=yes
+==15175== 
+==15175== For counts of detected and suppressed errors, rerun with: -v
+==15175== ERROR SUMMARY: 5 errors from 5 contexts (suppressed: 2 from 2)
